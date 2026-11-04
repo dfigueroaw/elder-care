@@ -1,0 +1,469 @@
+service: alert-button
+frameworkVersion: '3'
+
+# Per-stage parameters. Override on the CLI, e.g.
+#   npx serverless deploy --stage prod --param="sesSender=alerts@example.com"
+params:
+  default:
+    sesSender: ''               # verified SES identity; empty = email channel skipped
+    apnsPlatformAppArn: ''      # from scripts/setup-notifications.sh; empty = iOS push returns 503
+    gcmPlatformAppArn: ''       # from scripts/setup-notifications.sh; empty = Android push returns 503
+    deletionPolicy: Delete
+    logRetentionDays: 14
+  prod:
+    deletionPolicy: Retain
+    logRetentionDays: 90
+
+custom:
+  prefix: ${self:service}-${sls:stage}
+
+provider:
+  name: aws
+  runtime: python3.12
+  architecture: arm64
+  region: ${opt:region, 'us-east-1'}
+  stage: ${opt:stage, 'dev'}
+  memorySize: 256
+  timeout: 10
+  logRetentionInDays: ${param:logRetentionDays}
+  tracing:
+    lambda: true
+  logs:
+    httpApi: true
+
+  environment:
+    DEVICES_TABLE: ${self:custom.prefix}-devices
+    USER_PROFILES_TABLE: ${self:custom.prefix}-user-profiles
+    PUSH_ENDPOINTS_TABLE: ${self:custom.prefix}-push-endpoints
+    ALERTS_TABLE: ${self:custom.prefix}-alerts
+    PROVISIONING_TABLE: ${self:custom.prefix}-provisioning-sessions
+    ALERTS_QUEUE_URL: !Ref AlertsQueue
+    USER_TOPIC_PREFIX: ${self:custom.prefix}-user
+    APNS_PLATFORM_APP_ARN: ${param:apnsPlatformAppArn}
+    GCM_PLATFORM_APP_ARN: ${param:gcmPlatformAppArn}
+    SES_SENDER: ${param:sesSender}
+    SES_TEMPLATE: ${self:custom.prefix}-alert
+    DEFAULT_CHECKIN_SEC: '3600'
+
+  httpApi:
+    authorizers:
+      cognito:
+        type: jwt
+        identitySource: $request.header.Authorization
+        issuerUrl:
+          Fn::Join: ['', ['https://cognito-idp.', '${aws:region}', '.amazonaws.com/', !Ref UserPool]]
+        audience:
+          - !Ref UserPoolClient
+
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+            - dynamodb:Query
+            - dynamodb:ConditionCheckItem
+          # Matches every table of this stage and their indexes (table/<name>/index/<index>)
+          Resource: arn:aws:dynamodb:${aws:region}:${aws:accountId}:table/${self:custom.prefix}-*
+        - Effect: Allow
+          Action:
+            - kms:Encrypt
+            - kms:Decrypt
+            - kms:GenerateDataKey*
+            - kms:DescribeKey
+          Resource: !GetAtt DataKey.Arn
+        - Effect: Allow
+          Action: sqs:SendMessage
+          Resource: !GetAtt AlertsQueue.Arn
+        - Effect: Allow
+          Action:
+            - sns:CreateTopic
+            - sns:Subscribe
+            - sns:Unsubscribe
+          Resource: arn:aws:sns:${aws:region}:${aws:accountId}:${self:custom.prefix}-user-*
+        - Effect: Allow
+          Action:
+            - sns:CreatePlatformEndpoint
+            - sns:SetEndpointAttributes
+            - sns:GetEndpointAttributes
+            - sns:DeleteEndpoint
+          Resource:
+            - arn:aws:sns:${aws:region}:${aws:accountId}:app/*
+            - arn:aws:sns:${aws:region}:${aws:accountId}:endpoint/*
+        - Effect: Allow
+          # '*' is required for direct SMS publishes to phone numbers; also covers user topics
+          Action: sns:Publish
+          Resource: '*'
+        - Effect: Allow
+          Action: ses:SendTemplatedEmail
+          Resource: '*'
+
+package:
+  patterns:
+    - '!**'
+    - 'app/**'
+    - 'lambda/handler.py'
+    - '!**/__pycache__/**'
+
+functions:
+  # ---- Public ----
+  health:
+    handler: lambda/handler.lambda_handler
+    environment:
+      SERVICE_NAME: ${self:custom.prefix}
+    events:
+      - httpApi: GET /v1/health
+
+  # ---- Mobile (Cognito JWT) ----
+  createProvisioningSession:
+    handler: app/handlers/provisioning.create_session
+    events:
+      - httpApi:
+          method: POST
+          path: /v1/provisioning/sessions
+          authorizer: cognito
+  getProvisioningSession:
+    handler: app/handlers/provisioning.get_session
+    events:
+      - httpApi:
+          method: GET
+          path: /v1/provisioning/sessions/{pairingToken}
+          authorizer: cognito
+  listDevices:
+    handler: app/handlers/devices.list_devices
+    events:
+      - httpApi:
+          method: GET
+          path: /v1/devices
+          authorizer: cognito
+  updateDevice:
+    handler: app/handlers/devices.update_device
+    events:
+      - httpApi:
+          method: PATCH
+          path: /v1/devices/{deviceId}
+          authorizer: cognito
+  deleteDevice:
+    handler: app/handlers/devices.delete_device
+    events:
+      - httpApi:
+          method: DELETE
+          path: /v1/devices/{deviceId}
+          authorizer: cognito
+  getMe:
+    handler: app/handlers/users.get_me
+    events:
+      - httpApi:
+          method: GET
+          path: /v1/users/me
+          authorizer: cognito
+  updateNotifications:
+    handler: app/handlers/users.update_notifications
+    events:
+      - httpApi:
+          method: PATCH
+          path: /v1/users/me/notifications
+          authorizer: cognito
+  registerPushToken:
+    handler: app/handlers/push_tokens.register_token
+    events:
+      - httpApi:
+          method: POST
+          path: /v1/users/me/push-tokens
+          authorizer: cognito
+  deletePushToken:
+    handler: app/handlers/push_tokens.delete_token
+    events:
+      - httpApi:
+          method: DELETE
+          path: /v1/users/me/push-tokens/{endpointId}
+          authorizer: cognito
+  listAlerts:
+    handler: app/handlers/alerts.list_alerts
+    events:
+      - httpApi:
+          method: GET
+          path: /v1/alerts
+          authorizer: cognito
+
+  # ---- Device (Bearer deviceSecret, verified in the handler) ----
+  registerDevice:
+    handler: app/handlers/device_api.register
+    events:
+      - httpApi: POST /v1/devices/register
+  postAlert:
+    handler: app/handlers/device_api.post_alert
+    events:
+      - httpApi: POST /v1/alerts
+  postTelemetry:
+    handler: app/handlers/device_api.telemetry
+    events:
+      - httpApi: POST /v1/devices/telemetry
+
+  # ---- Async ----
+  alertsWorker:
+    handler: app/handlers/worker.handle
+    timeout: 30
+    events:
+      - sqs:
+          arn: !GetAtt AlertsQueue.Arn
+          batchSize: 5
+          functionResponseType: ReportBatchItemFailures
+  pushEvents:
+    handler: app/handlers/push_events.handle
+    events:
+      - sns:
+          arn: !Ref PushEventsTopic
+          topicName: ${self:custom.prefix}-push-events
+
+resources:
+  extensions:
+    # API-wide throttling (429 when exceeded)
+    HttpApiStage:
+      Properties:
+        DefaultRouteSettings:
+          ThrottlingBurstLimit: 100
+          ThrottlingRateLimit: 50
+
+  Resources:
+    # ---------- Encryption ----------
+    DataKey:
+      Type: AWS::KMS::Key
+      DeletionPolicy: ${param:deletionPolicy}
+      Properties:
+        Description: ${self:custom.prefix} DynamoDB encryption key
+        EnableKeyRotation: true
+        KeyPolicy:
+          Version: '2012-10-17'
+          Statement:
+            - Sid: AccountAdministration
+              Effect: Allow
+              Principal:
+                AWS: arn:aws:iam::${aws:accountId}:root
+              Action: kms:*
+              Resource: '*'
+    DataKeyAlias:
+      Type: AWS::KMS::Alias
+      Properties:
+        AliasName: alias/${self:custom.prefix}-data
+        TargetKeyId: !Ref DataKey
+
+    # ---------- DynamoDB ----------
+    DevicesTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: ${param:deletionPolicy}
+      Properties:
+        TableName: ${self:custom.prefix}-devices
+        BillingMode: PAY_PER_REQUEST
+        SSESpecification: { SSEEnabled: true, SSEType: KMS, KMSMasterKeyId: !Ref DataKey }
+        PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+        AttributeDefinitions:
+          - { AttributeName: deviceId, AttributeType: S }
+          - { AttributeName: ownerUserId, AttributeType: S }
+          - { AttributeName: hardwareId, AttributeType: S }
+        KeySchema:
+          - { AttributeName: deviceId, KeyType: HASH }
+        GlobalSecondaryIndexes:
+          - IndexName: ownerUserId-index
+            KeySchema:
+              - { AttributeName: ownerUserId, KeyType: HASH }
+              - { AttributeName: deviceId, KeyType: RANGE }
+            Projection: { ProjectionType: ALL }
+          # Enforces the 409 "hardware already registered" check on /devices/register
+          - IndexName: hardwareId-index
+            KeySchema:
+              - { AttributeName: hardwareId, KeyType: HASH }
+            Projection: { ProjectionType: INCLUDE, NonKeyAttributes: [status] }
+
+    UserProfilesTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: ${param:deletionPolicy}
+      Properties:
+        TableName: ${self:custom.prefix}-user-profiles
+        BillingMode: PAY_PER_REQUEST
+        SSESpecification: { SSEEnabled: true, SSEType: KMS, KMSMasterKeyId: !Ref DataKey }
+        PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+        AttributeDefinitions:
+          - { AttributeName: userId, AttributeType: S }
+        KeySchema:
+          - { AttributeName: userId, KeyType: HASH }
+
+    PushEndpointsTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: ${param:deletionPolicy}
+      Properties:
+        TableName: ${self:custom.prefix}-push-endpoints
+        BillingMode: PAY_PER_REQUEST
+        SSESpecification: { SSEEnabled: true, SSEType: KMS, KMSMasterKeyId: !Ref DataKey }
+        AttributeDefinitions:
+          - { AttributeName: endpointId, AttributeType: S }
+          - { AttributeName: userId, AttributeType: S }
+          - { AttributeName: endpointArn, AttributeType: S }
+        KeySchema:
+          - { AttributeName: endpointId, KeyType: HASH }
+        GlobalSecondaryIndexes:
+          - IndexName: userId-index
+            KeySchema:
+              - { AttributeName: userId, KeyType: HASH }
+              - { AttributeName: endpointId, KeyType: RANGE }
+            Projection: { ProjectionType: ALL }
+          # Re-registration dedupe and disabled-endpoint cleanup look up rows by ARN
+          - IndexName: endpointArn-index
+            KeySchema:
+              - { AttributeName: endpointArn, KeyType: HASH }
+            Projection: { ProjectionType: ALL }
+
+    AlertsTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: ${param:deletionPolicy}
+      Properties:
+        TableName: ${self:custom.prefix}-alerts
+        BillingMode: PAY_PER_REQUEST
+        SSESpecification: { SSEEnabled: true, SSEType: KMS, KMSMasterKeyId: !Ref DataKey }
+        PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+        TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+        AttributeDefinitions:
+          - { AttributeName: alertId, AttributeType: S }
+          - { AttributeName: userId, AttributeType: S }
+          - { AttributeName: deviceId, AttributeType: S }
+          - { AttributeName: receivedAt, AttributeType: S }
+        KeySchema:
+          - { AttributeName: alertId, KeyType: HASH }
+        GlobalSecondaryIndexes:
+          - IndexName: userId-receivedAt-index
+            KeySchema:
+              - { AttributeName: userId, KeyType: HASH }
+              - { AttributeName: receivedAt, KeyType: RANGE }
+            Projection: { ProjectionType: ALL }
+          - IndexName: deviceId-receivedAt-index
+            KeySchema:
+              - { AttributeName: deviceId, KeyType: HASH }
+              - { AttributeName: receivedAt, KeyType: RANGE }
+            Projection: { ProjectionType: ALL }
+
+    ProvisioningSessionsTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: Delete
+      Properties:
+        TableName: ${self:custom.prefix}-provisioning-sessions
+        BillingMode: PAY_PER_REQUEST
+        SSESpecification: { SSEEnabled: true, SSEType: KMS, KMSMasterKeyId: !Ref DataKey }
+        # TTL attributes must be numeric epoch seconds, so expiresAt is mirrored here
+        TimeToLiveSpecification: { AttributeName: expiresAtEpoch, Enabled: true }
+        AttributeDefinitions:
+          - { AttributeName: pairingToken, AttributeType: S }
+        KeySchema:
+          - { AttributeName: pairingToken, KeyType: HASH }
+
+    # ---------- SQS ----------
+    AlertsDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.prefix}-alerts-dlq.fifo
+        FifoQueue: true
+        MessageRetentionPeriod: 1209600
+        SqsManagedSseEnabled: true
+
+    AlertsQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.prefix}-alerts.fifo
+        FifoQueue: true
+        # Producers set MessageDeduplicationId = alertId (derived from dedupeKey when sent)
+        ContentBasedDeduplication: false
+        VisibilityTimeout: 180  # 6x worker timeout
+        SqsManagedSseEnabled: true
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt AlertsDLQ.Arn
+          maxReceiveCount: 3
+
+    AlertsDLQAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:custom.prefix}-alerts-dlq-not-empty
+        AlarmDescription: Alerts failed delivery 3 times and landed in the DLQ
+        Namespace: AWS/SQS
+        MetricName: ApproximateNumberOfMessagesVisible
+        Dimensions:
+          - { Name: QueueName, Value: !GetAtt AlertsDLQ.QueueName }
+        Statistic: Maximum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 0
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+
+    # ---------- SNS ----------
+    # Target for the platform applications' endpoint/delivery-failure events.
+    # Per-user topics (<prefix>-user-<sub>) are created at runtime by the API.
+    PushEventsTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:custom.prefix}-push-events
+
+    # ---------- SES ----------
+    AlertEmailTemplate:
+      Type: AWS::SES::Template
+      Properties:
+        Template:
+          TemplateName: ${self:custom.prefix}-alert
+          SubjectPart: '{{subject}}'
+          TextPart: "{{title}}\n\n{{body}}\n\nDevice: {{deviceName}}\nTime: {{time}}\n"
+          HtmlPart: >-
+            <h2>{{title}}</h2><p>{{body}}</p>
+            <p style="color:#666">Device: {{deviceName}}<br>Time: {{time}}</p>
+
+    # ---------- Cognito ----------
+    UserPool:
+      Type: AWS::Cognito::UserPool
+      DeletionPolicy: ${param:deletionPolicy}
+      Properties:
+        UserPoolName: ${self:custom.prefix}-users
+        UsernameAttributes: [email]
+        AutoVerifiedAttributes: [email]
+        Schema:
+          - { Name: email, AttributeDataType: String, Required: true, Mutable: true }
+        Policies:
+          PasswordPolicy:
+            MinimumLength: 8
+            RequireLowercase: true
+            RequireUppercase: true
+            RequireNumbers: true
+            RequireSymbols: false
+        AccountRecoverySetting:
+          RecoveryMechanisms:
+            - { Name: verified_email, Priority: 1 }
+
+    UserPoolClient:
+      Type: AWS::Cognito::UserPoolClient
+      Properties:
+        ClientName: ${self:custom.prefix}-mobile
+        UserPoolId: !Ref UserPool
+        GenerateSecret: false
+        PreventUserExistenceErrors: ENABLED
+        ExplicitAuthFlows:
+          - ALLOW_USER_SRP_AUTH
+          - ALLOW_USER_PASSWORD_AUTH  # handy for curl/CLI testing; remove for production
+          - ALLOW_REFRESH_TOKEN_AUTH
+        IdTokenValidity: 60
+        AccessTokenValidity: 60
+        RefreshTokenValidity: 30
+        TokenValidityUnits:
+          IdToken: minutes
+          AccessToken: minutes
+          RefreshToken: days
+
+  Outputs:
+    UserPoolId:
+      Value: !Ref UserPool
+    UserPoolClientId:
+      Value: !Ref UserPoolClient
+    PushEventsTopicArn:
+      Value: !Ref PushEventsTopic
+    AlertsQueueUrl:
+      Value: !Ref AlertsQueue
+    AlertsDLQUrl:
+      Value: !Ref AlertsDLQ

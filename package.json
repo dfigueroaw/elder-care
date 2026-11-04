@@ -1,0 +1,14 @@
+{
+  "name": "alert-button",
+  "private": true,
+  "description": "Serverless backend for the ESP32 alert button (API, DynamoDB, SQS, SNS, SES, Cognito)",
+  "scripts": {
+    "deploy": "serverless deploy",
+    "deploy:prod": "serverless deploy --stage prod",
+    "remove": "serverless remove",
+    "logs:worker": "serverless logs -f alertsWorker -t"
+  },
+  "devDependencies": {
+    "serverless": "^3.39.0"
+  }
+}
